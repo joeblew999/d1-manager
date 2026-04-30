@@ -16,15 +16,30 @@
 #
 # All tasks default to env=production; pass `-- --env <env>` to switch.
 
+[task_config]
+# Shared joeblew999 task library: cf:token-check, secrets:{status,sync-github,...},
+# fnox:init, etc. Same pin as auth-service.
+includes = ["git::https://github.com/joeblew999/.github.git//mise-tasks?ref=v0.4.0"]
+
 [tools]
 node                   = "24"
 "npm:wrangler"         = "4.84.1"
 "github:jdx/fnox"      = "1.23"
+"aqua:cli/cli"         = "2"      # gh CLI
 "aqua:jqlang/jq"       = "1"
 "aqua:a8m/envsubst"    = "1"
+"cargo:usage-cli"      = "3"
 
 [env]
-DEFAULT_ENV = "production"
+DEFAULT_ENV    = "production"
+
+# Subset of fnox keys to sync to GitHub Actions secrets via shared
+# `secrets:sync-github` task. (Empty = no sync — this fork deploys from a
+# dev machine; flip on if you ever wire CI deploys.)
+FNOX_SYNC_KEYS = ""
+
+# CLOUDFLARE_API_TOKEN is loaded from fnox per-task (in 10-deploy and
+# secrets:put-cf via the shared cf:token-check helper).
 
 # ── Helpers (resolve env file path + load it for downstream tasks) ───────────
 
@@ -110,18 +125,132 @@ echo "Done. Next: fnox set ACCOUNT_ID API_KEY TEAM_DOMAIN POLICY_AUD; then mise 
 
 # ── Secrets (fnox -> CF Worker secret store) ─────────────────────────────────
 
+[tasks."cf:access:setup"]
+description = "One-shot CF Access setup: ensure GitHub IdP + Access App for this Worker exist; write TEAM_DOMAIN + POLICY_AUD to fnox. Idempotent. Requires CLOUDFLARE_API_TOKEN with Access:Edit + Account.Settings:Read."
+depends     = ["cf:token-check"]
+run = '''
+set -e
+unset FNOX_AGE_KEY
+
+# Inputs
+file=$(mise run -q env:resolve)
+set -a; . "$file"; set +a
+TOKEN=$(fnox get CLOUDFLARE_API_TOKEN)
+ACCOUNT=$(fnox get CLOUDFLARE_ACCOUNT_ID)
+APP_DOMAIN="${WORKER_NAME}.${CF_SUBDOMAIN}.workers.dev"
+APP_NAME="${WORKER_NAME}"
+
+API="https://api.cloudflare.com/client/v4/accounts/$ACCOUNT"
+hdr=(-H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json")
+
+api_get()  { curl -sS "${hdr[@]}" "$API$1"; }
+api_post() { curl -sS -X POST "${hdr[@]}" -d "$2" "$API$1"; }
+ok()       { echo "$1" | jq -e '.success == true' >/dev/null 2>&1; }
+err_msg()  { echo "$1" | jq -r '.errors[]?.message // ""'; }
+
+echo "→ Checking Team Domain"
+org=$(api_get "/access/organizations")
+if ! ok "$org"; then echo "✗ access/organizations failed: $(err_msg "$org")"; exit 1; fi
+auth_domain=$(echo "$org" | jq -r '.result.auth_domain')
+team_url="https://${auth_domain}.cloudflareaccess.com"
+echo "  team_domain = $team_url"
+
+echo "→ Looking for GitHub OAuth Identity Provider"
+idps=$(api_get "/access/identity_providers")
+if ! ok "$idps"; then echo "✗ identity_providers list failed: $(err_msg "$idps")"; exit 1; fi
+gh_idp_id=$(echo "$idps" | jq -r '.result[] | select(.type == "github") | .id' | head -1)
+if [ -z "$gh_idp_id" ]; then
+  echo "✗ No GitHub IdP found in CF Access. Create one in the dashboard once:"
+  echo "  https://one.dash.cloudflare.com/?to=/:account/access/authentication"
+  echo "  Then re-run this task."
+  exit 1
+fi
+echo "  github_idp_id = $gh_idp_id"
+
+echo "→ Looking for existing Access App for $APP_DOMAIN"
+apps=$(api_get "/access/apps")
+if ! ok "$apps"; then echo "✗ apps list failed: $(err_msg "$apps")"; exit 1; fi
+app_aud=$(echo "$apps" | jq -r --arg d "$APP_DOMAIN" '.result[] | select(.domain == $d) | .aud' | head -1)
+if [ -z "$app_aud" ]; then
+  echo "→ Creating Access Application for $APP_DOMAIN"
+  body=$(jq -n \
+    --arg name "$APP_NAME" \
+    --arg domain "$APP_DOMAIN" \
+    --arg idp "$gh_idp_id" \
+    '{
+      name: $name,
+      domain: $domain,
+      type: "self_hosted",
+      session_duration: "24h",
+      auto_redirect_to_identity: true,
+      allowed_idps: [$idp]
+    }')
+  resp=$(api_post "/access/apps" "$body")
+  if ! ok "$resp"; then echo "✗ create app failed: $(err_msg "$resp")"; exit 1; fi
+  app_id=$(echo "$resp" | jq -r '.result.id')
+  app_aud=$(echo "$resp" | jq -r '.result.aud')
+  echo "  created app id=$app_id aud=$app_aud"
+
+  # Default policy: allow the operator's GitHub account.
+  # If GITHUB_ALLOW is unset, we just create the app with no policy and the
+  # operator can add one in the dashboard. (CF will deny by default until then.)
+  if [ -n "${GITHUB_ALLOW_LOGIN:-}" ]; then
+    echo "→ Adding allow policy for github user '$GITHUB_ALLOW_LOGIN'"
+    pbody=$(jq -n \
+      --arg login "$GITHUB_ALLOW_LOGIN" \
+      --arg idp "$gh_idp_id" \
+      '{
+        name: "operator-only",
+        decision: "allow",
+        include: [{
+          github: { name: $login, identity_provider_id: $idp }
+        }]
+      }')
+    presp=$(api_post "/access/apps/$app_id/policies" "$pbody")
+    ok "$presp" || echo "  ⚠ policy create failed: $(err_msg "$presp")"
+  fi
+else
+  echo "  found existing app aud=$app_aud"
+fi
+
+echo
+echo "→ Writing values back to fnox"
+fnox set --global -p keychain CF_ACCESS_TEAM_DOMAIN <<< "$team_url"
+fnox set --global -p keychain D1_MANAGER_POLICY_AUD <<< "$app_aud"
+echo "  ✓ CF_ACCESS_TEAM_DOMAIN  = $team_url"
+echo "  ✓ D1_MANAGER_POLICY_AUD  = $app_aud"
+echo
+echo "Next: mise run secrets:put-cf  →  mise run 10-deploy  →  mise run prove:deployed"
+'''
+
 [tasks."secrets:put-cf"]
-description = "Pull ACCOUNT_ID, API_KEY, TEAM_DOMAIN, POLICY_AUD from fnox; push to the deployed Worker."
+description = "Push CF Access secrets from fnox to the deployed Worker. Maps fnox canonical names -> d1-manager Worker env names."
 depends     = ["wrangler:gen"]
 run = '''
 set -e
-for key in ACCOUNT_ID API_KEY TEAM_DOMAIN POLICY_AUD; do
-  val=$(mise exec -- fnox get "$key" 2>/dev/null || true)
+unset FNOX_AGE_KEY
+
+# Pairs of "<fnox-key>:<worker-secret-name>". Canonical fnox names live in
+# the joeblew999 ecosystem (CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID).
+# d1-manager's worker code reads ACCOUNT_ID, API_KEY, etc. — we map.
+declare -a pairs=(
+  "CLOUDFLARE_ACCOUNT_ID:ACCOUNT_ID"
+  "CLOUDFLARE_API_TOKEN:API_KEY"
+  "CF_ACCESS_TEAM_DOMAIN:TEAM_DOMAIN"
+  "D1_MANAGER_POLICY_AUD:POLICY_AUD"
+)
+
+for pair in "${pairs[@]}"; do
+  fnox_key="${pair%%:*}"
+  worker_name="${pair##*:}"
+  val=$(fnox get "$fnox_key" 2>/dev/null || true)
   if [ -z "$val" ]; then
-    echo "ERROR: fnox has no value for '$key'. Set it first: fnox set $key" >&2
+    echo "ERROR: fnox has no value for '$fnox_key'." >&2
+    echo "       Set it: fnox set --global -p keychain $fnox_key" >&2
     exit 1
   fi
-  echo "$val" | wrangler secret put "$key"
+  echo "→ wrangler secret put $worker_name  (from fnox:$fnox_key)"
+  echo "$val" | wrangler secret put "$worker_name"
 done
 '''
 
@@ -138,17 +267,12 @@ depends     = ["wrangler:gen"]
 run         = "npm run build"
 
 [tasks."10-deploy"]
-description = "Build + deploy the Worker."
-depends     = ["6-build"]
+description = "Build + deploy the Worker. Validates CF token before deploy via shared cf:token-check."
+depends     = ["6-build", "cf:token-check"]
 run = '''
 set -e
-# Force-populate CLOUDFLARE_API_TOKEN from fnox so wrangler doesn't fall
-# back to its OAuth token (24h expiry footgun).
-if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
-  if T=$(mise exec -- fnox get API_KEY 2>/dev/null) && [ -n "$T" ]; then
-    export CLOUDFLARE_API_TOKEN="$T"
-  fi
-fi
+unset FNOX_AGE_KEY
+export CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN:-$(fnox get CLOUDFLARE_API_TOKEN 2>/dev/null || true)}"
 wrangler deploy
 '''
 

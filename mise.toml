@@ -3,26 +3,25 @@
 # Layered on top of upstream d1-manager. Heavy lifting lives in the shared
 # joeblew999/.github/mise-tasks library imported below. This file only adds:
 #   - tools pin
-#   - env vars (FNOX_SYNC_KEYS, etc.)
+#   - env vars
 #   - phased deploy orchestrators (1-install, 6-build, 10-deploy)
-#   - per-fork wrangler:gen + prove:* checks
+#   - prove:all wiring (the four prove:* checks come from shared)
 #
 # Deploy lifecycle (one time):
 #   1. cp config/template.env config/production.env  # fill CF_SUBDOMAIN, OPERATOR_EMAIL
 #   2. fnox set --global -p keychain CLOUDFLARE_API_TOKEN  # one-time per machine
 #      fnox set --global -p keychain CLOUDFLARE_ACCOUNT_ID
-#   3. mise run cf:provision-d1-r2   # creates R2 + D1, writes IDs back
-#   4. mise run cf:access-setup      # creates Access App + policy, writes fnox values
+#   3. mise run cf:provision-d1-r2     # creates R2 + D1, writes IDs back
+#   4. mise run cf:access-setup        # creates Access App + policy, writes fnox values
 #   5. mise run cf:secrets-put-mapped  # 4 fnox -> Worker secrets
 #   6. mise run 10-deploy
 #   7. mise run prove:all
-#
-# All tasks default to env=production; pass `-- --env <env>` to switch.
 
 [task_config]
-# Shared joeblew999 task library. v0.6.0 brings cf:access-setup,
-# cf:provision-d1-r2, cf:secrets-put-mapped, env:resolve.
-includes = ["git::https://github.com/joeblew999/.github.git//mise-tasks?ref=v0.6.0"]
+# Shared joeblew999 task library. v0.7.0 brings cf:access-setup,
+# cf:provision-d1-r2, cf:secrets-put-mapped, env:resolve, wrangler:gen,
+# and the four prove:* checks.
+includes = ["git::https://github.com/joeblew999/.github.git//mise-tasks?ref=v0.7.0"]
 
 [tools]
 node                   = "24"
@@ -35,13 +34,9 @@ node                   = "24"
 
 [env]
 DEFAULT_ENV    = "production"
-
-# Subset of fnox keys to sync to GitHub Actions secrets via shared
-# `secrets:sync-github` task. Empty = no sync (this fork deploys from a
-# dev machine).
 FNOX_SYNC_KEYS = ""
 
-# ── Per-fork inline tasks ─────────────────────────────────────────────────────
+# ── Per-fork inline tasks (everything else comes from shared) ────────────────
 
 [tasks."env:dump"]
 description = "Print all keys + values from config/<env>.env (default: production)."
@@ -58,16 +53,6 @@ run         = "ls -1 config/*.env 2>/dev/null | grep -v template.env || echo 'no
 [tasks."1-install"]
 description = "Install npm deps (first time)."
 run         = "npm install"
-
-[tasks."wrangler:gen"]
-description = "Generate wrangler.toml from wrangler.toml.template + config/<env>.env."
-run = '''
-set -e
-file=$(mise run -q env:resolve)
-set -a; . "$file"; set +a
-envsubst < wrangler.toml.template > wrangler.toml
-echo "wrote wrangler.toml from $file"
-'''
 
 [tasks."6-build"]
 description = "Build the Vite SPA (dist/) — required before deploy."
@@ -94,8 +79,6 @@ description = "List secrets currently set on the deployed Worker (values hidden)
 depends     = ["wrangler:gen"]
 run         = "wrangler secret list"
 
-# ── Dev (local) ──────────────────────────────────────────────────────────────
-
 [tasks.dev]
 description = "Run d1-manager locally (Vite + wrangler dev)."
 depends     = ["wrangler:gen"]
@@ -110,90 +93,7 @@ run         = "wrangler tail"
 description = "Show current Cloudflare auth identity."
 run         = "wrangler whoami"
 
-# ── prove:* — end-to-end deploy verification ─────────────────────────────────
-
-[tasks."prove:deployed"]
-description = "Smoke-test the deployed Worker — expect 302 to CF Access challenge with our AUD."
-run = '''
-set -e
-unset FNOX_AGE_KEY
-file=$(mise run -q env:resolve)
-set -a; . "$file"; set +a
-url="https://${WORKER_NAME}.${CF_SUBDOMAIN}.workers.dev"
-expected_aud=$(fnox get "$APP_POLICY_AUD_FNOX_KEY")
-
-echo "GET $url"
-hdrs=$(curl -sI "$url" | tr -d '\r')
-status=$(echo "$hdrs" | head -1)
-loc=$(echo "$hdrs" | awk '/^location:/ {print $2}')
-echo "  $status"
-echo "  location: ${loc:0:120}..."
-
-[[ "$status" =~ ^HTTP/[0-9.]+[[:space:]]+302 ]] \
-  || { echo "✗ expected 302, got: $status"; exit 1; }
-[[ "$loc" == *"/cdn-cgi/access/login/"* ]] \
-  || { echo "✗ location is not a CF Access challenge URL"; exit 1; }
-[[ "$loc" == *"kid=$expected_aud"* ]] \
-  || { echo "✗ challenge AUD does not match fnox:$APP_POLICY_AUD_FNOX_KEY"; exit 1; }
-echo "✓ CF Access is gating with the correct app AUD"
-'''
-
-[tasks."prove:access:policy"]
-description = "Verify the CF Access App for this Worker has at least one allow policy."
-depends     = ["cf:token-check"]
-run = '''
-set -e
-unset FNOX_AGE_KEY
-file=$(mise run -q env:resolve)
-set -a; . "$file"; set +a
-TOKEN=$(fnox get CLOUDFLARE_API_TOKEN)
-ACCOUNT=$(fnox get CLOUDFLARE_ACCOUNT_ID)
-APP_DOMAIN="${WORKER_NAME}.${CF_SUBDOMAIN}.workers.dev"
-
-TMPD=$(mktemp -d); trap "rm -rf '$TMPD'" EXIT
-hdr=(-H "Authorization: Bearer $TOKEN")
-API="https://api.cloudflare.com/client/v4/accounts/$ACCOUNT"
-
-curl -sS "${hdr[@]}" "$API/access/apps" -o "$TMPD/apps.json"
-APP_ID=$(jq -r --arg d "$APP_DOMAIN" '.result[] | select(.domain == $d) | .id' "$TMPD/apps.json" | head -1)
-[ -z "$APP_ID" ] && { echo "✗ no Access App found for $APP_DOMAIN — run cf:access-setup first"; exit 1; }
-
-curl -sS "${hdr[@]}" "$API/access/apps/$APP_ID/policies" -o "$TMPD/pol.json"
-allow_count=$(jq '[.result[] | select(.decision=="allow")] | length' "$TMPD/pol.json")
-[ "$allow_count" -lt 1 ] && {
-  echo "✗ Access App $APP_DOMAIN has no allow policy. Login would 403 after OAuth."
-  echo "  Re-run cf:access-setup with OPERATOR_EMAIL set in config/<env>.env."
-  exit 1
-}
-echo "✓ Access App $APP_DOMAIN has $allow_count allow policy/policies"
-jq -r '.result[] | "  - \(.name): \(.decision) [\(.include | map(keys[0]) | join(","))]"' "$TMPD/pol.json"
-'''
-
-[tasks."prove:bindings"]
-description = "Confirm the deployed Worker's bindings via wrangler --dry-run."
-depends     = ["wrangler:gen"]
-run = '''
-set -e
-echo "→ wrangler deploy --dry-run"
-wrangler deploy --dry-run --outdir build/dryrun 2>&1 | grep -E '^Binding|^Total Upload|env\.|^\s+env\.' | head -20
-'''
-
-[tasks."prove:secrets"]
-description = "List secrets on the deployed Worker. Should show 4: ACCOUNT_ID, API_KEY, TEAM_DOMAIN, POLICY_AUD."
-depends     = ["wrangler:gen"]
-run = '''
-set -e
-out=$(wrangler secret list 2>&1)
-echo "$out"
-echo
-for k in ACCOUNT_ID API_KEY TEAM_DOMAIN POLICY_AUD; do
-  echo "$out" | grep -q "\"$k\"" \
-    && echo "  ✓ $k present" \
-    || { echo "  ✗ $k MISSING — run cf:secrets-put-mapped"; exit 1; }
-done
-'''
-
 [tasks."prove:all"]
 description = "Run every prove:* check in order. Fails fast on first miss."
-depends     = ["prove:deployed", "prove:access:policy", "prove:bindings", "prove:secrets"]
+depends     = ["prove:deployed", "prove:access-policy", "prove:bindings", "prove:secrets"]
 run         = "echo '✓ all checks passed.'"

@@ -1,0 +1,64 @@
+# Cloudflare D1 Database Manager — Worker config
+#
+# DO NOT EDIT wrangler.toml directly. Edit this template, then:
+#   mise run wrangler:gen     # envsubst this template -> wrangler.toml
+# Variables come from config/<env>.env (default env: production).
+
+name                = "$WORKER_NAME"
+main                = "worker/index.ts"
+compatibility_date  = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev         = true        # we deploy to *.workers.dev — no custom domain in the gedw99 fork
+preview_urls        = false
+
+[build]
+command = "npm run build"
+
+[assets]
+directory = "./dist"
+binding   = "ASSETS"
+
+# d1-manager's own metadata DB (saved queries, history, etc.)
+[[d1_databases]]
+binding       = "METADATA"
+database_name = "$METADATA_DB_NAME"
+database_id   = "$METADATA_DB_ID"
+
+# R2 bucket — d1-manager writes hourly DB snapshots here.
+[[r2_buckets]]
+binding     = "BACKUP_BUCKET"
+bucket_name = "$BACKUP_BUCKET_NAME"
+
+# Backup orchestration Durable Object (self-referencing — script_name == name above).
+[[durable_objects.bindings]]
+name        = "BACKUP_DO"
+class_name  = "BackupDO"
+script_name = "$WORKER_NAME"
+
+[[migrations]]
+tag         = "v1"
+new_classes = ["BackupDO"]
+
+# Hourly backup trigger.
+[triggers]
+crons = ["0 * * * *"]
+
+# AI Search over schemas — no resource needed, just the binding.
+[ai]
+binding = "AI"
+
+# Custom domain: NOT used in this fork. We deploy to ${WORKER_NAME}.${CF_SUBDOMAIN}.workers.dev
+# behind Cloudflare Access (Zero Trust app gating that URL). The upstream
+# [[routes]] block has been removed.
+
+[observability]
+[observability.logs]
+enabled            = true
+head_sampling_rate = 1
+persist            = true
+invocation_logs    = true
+
+[observability.traces]
+enabled            = true
+head_sampling_rate = 1
+persist            = true

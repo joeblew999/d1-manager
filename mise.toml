@@ -1,0 +1,194 @@
+# d1-manager fork — operator deploy tooling.
+#
+# This is joeblew999's fork of neverinfamous/d1-manager. Adds mise tooling
+# matching the joeblew999 convention (auth-service / authz-core), so the
+# fork is operator-friendly: phased tasks, fnox-managed secrets, env-driven
+# wrangler.toml templating.
+#
+# Deploy lifecycle (one time):
+#   1. cp config/template.env config/production.env
+#   2. Edit config/production.env: set WORKER_NAME + CF_SUBDOMAIN
+#   3. mise run cf:provision      # creates R2 bucket + metadata D1, writes IDs back
+#   4. fnox set ACCOUNT_ID API_KEY TEAM_DOMAIN POLICY_AUD   # one-time, in dashboard first
+#   5. mise run secrets:put-cf    # push to Worker secret store
+#   6. mise run 10-deploy
+#   7. mise run prove:deployed
+#
+# All tasks default to env=production; pass `-- --env <env>` to switch.
+
+[tools]
+node                   = "24"
+"npm:wrangler"         = "4.84.1"
+"github:jdx/fnox"      = "1.23"
+"aqua:jqlang/jq"       = "1"
+"aqua:a8m/envsubst"    = "1"
+
+[env]
+DEFAULT_ENV = "production"
+
+# ── Helpers (resolve env file path + load it for downstream tasks) ───────────
+
+[tasks."env:resolve"]
+description = "Resolve which config/<env>.env file to read; default `production`."
+hide        = true
+run = '''
+env_name="${MISE_ENV:-${ENV:-production}}"
+file="config/${env_name}.env"
+if [ ! -f "$file" ]; then
+  echo "ERROR: $file not found." >&2
+  echo "       cp config/template.env $file  and fill it in." >&2
+  exit 1
+fi
+echo "$file"
+'''
+
+[tasks."env:dump"]
+description = "Print all keys + values from config/<env>.env (default: production)."
+run = '''
+file=$(mise run -q env:resolve)
+echo "# $file"
+cat "$file"
+'''
+
+# ── Phase 0 — install + generate wrangler.toml from template ─────────────────
+
+[tasks."1-install"]
+description = "Install npm deps (first time)."
+run         = "npm install"
+
+[tasks."wrangler:gen"]
+description = "Generate wrangler.toml from wrangler.toml.template + config/<env>.env"
+run = '''
+set -e
+file=$(mise run -q env:resolve)
+set -a; . "$file"; set +a
+envsubst < wrangler.toml.template > wrangler.toml
+echo "wrote wrangler.toml from $file"
+'''
+
+# ── Cloudflare resources (one-time provisioning) ─────────────────────────────
+
+[tasks."cf:provision"]
+description = "Create R2 bucket + metadata D1 for the active env. Writes resource IDs back to config/<env>.env. Idempotent."
+run = '''
+set -e
+file=$(mise run -q env:resolve)
+set -a; . "$file"; set +a
+
+# R2 bucket — idempotent.
+if wrangler r2 bucket info "$BACKUP_BUCKET_NAME" >/dev/null 2>&1; then
+  echo "✓ R2 bucket '$BACKUP_BUCKET_NAME' already exists"
+else
+  echo "Creating R2 bucket '$BACKUP_BUCKET_NAME' ..."
+  wrangler r2 bucket create "$BACKUP_BUCKET_NAME"
+fi
+
+# Metadata D1 — idempotent. wrangler d1 list -> grep.
+if [ -n "$METADATA_DB_ID" ]; then
+  echo "✓ Metadata D1 id already set ($METADATA_DB_ID); skipping create."
+else
+  echo "Creating D1 database '$METADATA_DB_NAME' ..."
+  out=$(wrangler d1 create "$METADATA_DB_NAME")
+  id=$(echo "$out" | grep -oE 'database_id\s*=\s*"[^"]+"' | head -1 | sed -E 's/.*"([^"]+)"/\1/')
+  if [ -z "$id" ]; then
+    echo "ERROR: could not parse database_id from output:" >&2
+    echo "$out" >&2
+    exit 1
+  fi
+  # Write back to config/<env>.env (sed replace).
+  sed -i.bak -E "s|^METADATA_DB_ID=.*|METADATA_DB_ID=$id|" "$file"
+  rm -f "$file.bak"
+  echo "✓ Created D1 '$METADATA_DB_NAME' (id $id) and wrote to $file"
+fi
+
+# Apply schema.sql (idempotent — wrangler skips already-applied statements).
+echo "Applying worker/schema.sql to '$METADATA_DB_NAME' ..."
+wrangler d1 execute "$METADATA_DB_NAME" --remote --file=worker/schema.sql || true
+echo "Done. Next: fnox set ACCOUNT_ID API_KEY TEAM_DOMAIN POLICY_AUD; then mise run secrets:put-cf"
+'''
+
+# ── Secrets (fnox -> CF Worker secret store) ─────────────────────────────────
+
+[tasks."secrets:put-cf"]
+description = "Pull ACCOUNT_ID, API_KEY, TEAM_DOMAIN, POLICY_AUD from fnox; push to the deployed Worker."
+depends     = ["wrangler:gen"]
+run = '''
+set -e
+for key in ACCOUNT_ID API_KEY TEAM_DOMAIN POLICY_AUD; do
+  val=$(mise exec -- fnox get "$key" 2>/dev/null || true)
+  if [ -z "$val" ]; then
+    echo "ERROR: fnox has no value for '$key'. Set it first: fnox set $key" >&2
+    exit 1
+  fi
+  echo "$val" | wrangler secret put "$key"
+done
+'''
+
+[tasks."secrets:cf:list"]
+description = "List secrets currently set on the deployed Worker (values hidden)."
+depends     = ["wrangler:gen"]
+run         = "wrangler secret list"
+
+# ── Build + deploy ───────────────────────────────────────────────────────────
+
+[tasks."6-build"]
+description = "Build the Vite SPA (web/dist/) — required before deploy."
+depends     = ["wrangler:gen"]
+run         = "npm run build"
+
+[tasks."10-deploy"]
+description = "Build + deploy the Worker."
+depends     = ["6-build"]
+run = '''
+set -e
+# Force-populate CLOUDFLARE_API_TOKEN from fnox so wrangler doesn't fall
+# back to its OAuth token (24h expiry footgun).
+if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+  if T=$(mise exec -- fnox get API_KEY 2>/dev/null) && [ -n "$T" ]; then
+    export CLOUDFLARE_API_TOKEN="$T"
+  fi
+fi
+wrangler deploy
+'''
+
+[tasks."10b-redeploy"]
+description = "Re-deploy without rebuilding (fast iteration after wrangler.toml/secret changes)."
+depends     = ["wrangler:gen"]
+run         = "wrangler deploy"
+
+# ── Verification ─────────────────────────────────────────────────────────────
+
+[tasks."prove:deployed"]
+description = "Smoke-test the deployed Worker — expect 302 to GitHub OAuth via CF Access (proves Access is gating it)."
+run = '''
+set -e
+file=$(mise run -q env:resolve)
+set -a; . "$file"; set +a
+url="https://${WORKER_NAME}.${CF_SUBDOMAIN}.workers.dev"
+echo "GET $url"
+curl -sI "$url" | head -5
+echo
+echo "Expected: HTTP/2 302 with location: <CF Access challenge URL>"
+'''
+
+# ── Dev (local) ──────────────────────────────────────────────────────────────
+
+[tasks.dev]
+description = "Run d1-manager locally (Vite + wrangler dev)."
+depends     = ["wrangler:gen"]
+run         = "npm run dev"
+
+# ── Lifecycle helpers ────────────────────────────────────────────────────────
+
+[tasks.tail]
+description = "Tail live worker logs."
+depends     = ["wrangler:gen"]
+run         = "wrangler tail"
+
+[tasks.whoami]
+description = "Show current Cloudflare auth identity."
+run         = "wrangler whoami"
+
+[tasks."env:list"]
+description = "List every env config (config/<name>.env)."
+run         = "ls -1 config/*.env 2>/dev/null | grep -v template.env || echo 'no env files yet — copy config/template.env'"

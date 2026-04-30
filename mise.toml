@@ -143,34 +143,42 @@ APP_NAME="${WORKER_NAME}"
 API="https://api.cloudflare.com/client/v4/accounts/$ACCOUNT"
 hdr=(-H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json")
 
-api_get()  { curl -sS "${hdr[@]}" "$API$1"; }
-api_post() { curl -sS -X POST "${hdr[@]}" -d "$2" "$API$1"; }
-ok()       { echo "$1" | jq -e '.success == true' >/dev/null 2>&1; }
-err_msg()  { echo "$1" | jq -r '.errors[]?.message // ""'; }
+# Responses go to a temp dir — bash variable round-tripping corrupts the
+# raw \r in some app payloads (X.509 certs etc.) and jq fails.
+TMPD=$(mktemp -d)
+trap "rm -rf '$TMPD'" EXIT
+
+api_get()  { curl -sS "${hdr[@]}" "$API$1" -o "$TMPD/r.json"; printf '%s' "$TMPD/r.json"; }
+api_post() { curl -sS -X POST "${hdr[@]}" -d "$2" "$API$1" -o "$TMPD/r.json"; printf '%s' "$TMPD/r.json"; }
+ok()       { jq -e '.success == true' "$1" >/dev/null 2>&1; }
+err_msg()  { jq -r '.errors[]?.message // empty' "$1"; }
 
 echo "→ Checking Team Domain"
-org=$(api_get "/access/organizations")
-if ! ok "$org"; then echo "✗ access/organizations failed: $(err_msg "$org")"; exit 1; fi
-auth_domain=$(echo "$org" | jq -r '.result.auth_domain')
-team_url="https://${auth_domain}.cloudflareaccess.com"
+f=$(api_get "/access/organizations")
+if ! ok "$f"; then echo "✗ access/organizations failed: $(err_msg "$f")"; exit 1; fi
+auth_domain=$(jq -r '.result.auth_domain' "$f")
+team_url="https://${auth_domain}"
 echo "  team_domain = $team_url"
 
-echo "→ Looking for GitHub OAuth Identity Provider"
-idps=$(api_get "/access/identity_providers")
-if ! ok "$idps"; then echo "✗ identity_providers list failed: $(err_msg "$idps")"; exit 1; fi
-gh_idp_id=$(echo "$idps" | jq -r '.result[] | select(.type == "github") | .id' | head -1)
+echo "→ Listing existing Access Apps"
+f=$(api_get "/access/apps")
+if ! ok "$f"; then echo "✗ apps list failed: $(err_msg "$f")"; exit 1; fi
+cp "$f" "$TMPD/apps.json"
+
+echo "→ Resolving Identity Provider UUID"
+# /access/identity_providers needs scope we don't have; inherit IdP from
+# any existing app that has one (auth-service-style apps already do).
+gh_idp_id=$(jq -r '.result[].allowed_idps[]?' "$TMPD/apps.json" | head -1)
 if [ -z "$gh_idp_id" ]; then
-  echo "✗ No GitHub IdP found in CF Access. Create one in the dashboard once:"
+  echo "✗ No existing Access App has an IdP set — can't infer the IdP UUID."
+  echo "  Create at least one app + IdP via dashboard once:"
   echo "  https://one.dash.cloudflare.com/?to=/:account/access/authentication"
-  echo "  Then re-run this task."
   exit 1
 fi
-echo "  github_idp_id = $gh_idp_id"
+echo "  idp_id = $gh_idp_id  (inherited from an existing app)"
 
 echo "→ Looking for existing Access App for $APP_DOMAIN"
-apps=$(api_get "/access/apps")
-if ! ok "$apps"; then echo "✗ apps list failed: $(err_msg "$apps")"; exit 1; fi
-app_aud=$(echo "$apps" | jq -r --arg d "$APP_DOMAIN" '.result[] | select(.domain == $d) | .aud' | head -1)
+app_aud=$(jq -r --arg d "$APP_DOMAIN" '.result[] | select(.domain == $d) | .aud' "$TMPD/apps.json" | head -1)
 if [ -z "$app_aud" ]; then
   echo "→ Creating Access Application for $APP_DOMAIN"
   body=$(jq -n \
@@ -185,15 +193,12 @@ if [ -z "$app_aud" ]; then
       auto_redirect_to_identity: true,
       allowed_idps: [$idp]
     }')
-  resp=$(api_post "/access/apps" "$body")
-  if ! ok "$resp"; then echo "✗ create app failed: $(err_msg "$resp")"; exit 1; fi
-  app_id=$(echo "$resp" | jq -r '.result.id')
-  app_aud=$(echo "$resp" | jq -r '.result.aud')
+  f=$(api_post "/access/apps" "$body")
+  if ! ok "$f"; then echo "✗ create app failed: $(err_msg "$f")"; exit 1; fi
+  app_id=$(jq -r '.result.id' "$f")
+  app_aud=$(jq -r '.result.aud' "$f")
   echo "  created app id=$app_id aud=$app_aud"
 
-  # Default policy: allow the operator's GitHub account.
-  # If GITHUB_ALLOW is unset, we just create the app with no policy and the
-  # operator can add one in the dashboard. (CF will deny by default until then.)
   if [ -n "${GITHUB_ALLOW_LOGIN:-}" ]; then
     echo "→ Adding allow policy for github user '$GITHUB_ALLOW_LOGIN'"
     pbody=$(jq -n \
@@ -206,8 +211,8 @@ if [ -z "$app_aud" ]; then
           github: { name: $login, identity_provider_id: $idp }
         }]
       }')
-    presp=$(api_post "/access/apps/$app_id/policies" "$pbody")
-    ok "$presp" || echo "  ⚠ policy create failed: $(err_msg "$presp")"
+    f=$(api_post "/access/apps/$app_id/policies" "$pbody")
+    ok "$f" || echo "  ⚠ policy create failed: $(err_msg "$f")"
   fi
 else
   echo "  found existing app aud=$app_aud"
@@ -263,7 +268,7 @@ run         = "wrangler secret list"
 
 [tasks."6-build"]
 description = "Build the Vite SPA (web/dist/) — required before deploy."
-depends     = ["wrangler:gen"]
+depends     = ["1-install", "wrangler:gen"]
 run         = "npm run build"
 
 [tasks."10-deploy"]

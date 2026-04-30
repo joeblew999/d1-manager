@@ -1,31 +1,34 @@
 # d1-manager fork — operator deploy tooling.
 #
-# This is joeblew999's fork of neverinfamous/d1-manager. Adds mise tooling
-# matching the joeblew999 convention (auth-service / authz-core), so the
-# fork is operator-friendly: phased tasks, fnox-managed secrets, env-driven
-# wrangler.toml templating.
+# Layered on top of upstream d1-manager. Heavy lifting lives in the shared
+# joeblew999/.github/mise-tasks library imported below. This file only adds:
+#   - tools pin
+#   - env vars (FNOX_SYNC_KEYS, etc.)
+#   - phased deploy orchestrators (1-install, 6-build, 10-deploy)
+#   - per-fork wrangler:gen + prove:* checks
 #
 # Deploy lifecycle (one time):
-#   1. cp config/template.env config/production.env
-#   2. Edit config/production.env: set WORKER_NAME + CF_SUBDOMAIN
-#   3. mise run cf:provision      # creates R2 bucket + metadata D1, writes IDs back
-#   4. fnox set ACCOUNT_ID API_KEY TEAM_DOMAIN POLICY_AUD   # one-time, in dashboard first
-#   5. mise run secrets:put-cf    # push to Worker secret store
+#   1. cp config/template.env config/production.env  # fill CF_SUBDOMAIN, OPERATOR_EMAIL
+#   2. fnox set --global -p keychain CLOUDFLARE_API_TOKEN  # one-time per machine
+#      fnox set --global -p keychain CLOUDFLARE_ACCOUNT_ID
+#   3. mise run cf:provision-d1-r2   # creates R2 + D1, writes IDs back
+#   4. mise run cf:access-setup      # creates Access App + policy, writes fnox values
+#   5. mise run cf:secrets-put-mapped  # 4 fnox -> Worker secrets
 #   6. mise run 10-deploy
-#   7. mise run prove:deployed
+#   7. mise run prove:all
 #
 # All tasks default to env=production; pass `-- --env <env>` to switch.
 
 [task_config]
-# Shared joeblew999 task library: cf:token-check, secrets:{status,sync-github,...},
-# fnox:init, etc. Same pin as auth-service.
-includes = ["git::https://github.com/joeblew999/.github.git//mise-tasks?ref=v0.4.0"]
+# Shared joeblew999 task library. v0.6.0 brings cf:access-setup,
+# cf:provision-d1-r2, cf:secrets-put-mapped, env:resolve.
+includes = ["git::https://github.com/joeblew999/.github.git//mise-tasks?ref=v0.6.0"]
 
 [tools]
 node                   = "24"
 "npm:wrangler"         = "4.84.1"
 "github:jdx/fnox"      = "1.23"
-"aqua:cli/cli"         = "2"      # gh CLI
+"aqua:cli/cli"         = "2"
 "aqua:jqlang/jq"       = "1"
 "aqua:a8m/envsubst"    = "1"
 "cargo:usage-cli"      = "3"
@@ -34,28 +37,11 @@ node                   = "24"
 DEFAULT_ENV    = "production"
 
 # Subset of fnox keys to sync to GitHub Actions secrets via shared
-# `secrets:sync-github` task. (Empty = no sync — this fork deploys from a
-# dev machine; flip on if you ever wire CI deploys.)
+# `secrets:sync-github` task. Empty = no sync (this fork deploys from a
+# dev machine).
 FNOX_SYNC_KEYS = ""
 
-# CLOUDFLARE_API_TOKEN is loaded from fnox per-task (in 10-deploy and
-# secrets:put-cf via the shared cf:token-check helper).
-
-# ── Helpers (resolve env file path + load it for downstream tasks) ───────────
-
-[tasks."env:resolve"]
-description = "Resolve which config/<env>.env file to read; default `production`."
-hide        = true
-run = '''
-env_name="${MISE_ENV:-${ENV:-production}}"
-file="config/${env_name}.env"
-if [ ! -f "$file" ]; then
-  echo "ERROR: $file not found." >&2
-  echo "       cp config/template.env $file  and fill it in." >&2
-  exit 1
-fi
-echo "$file"
-'''
+# ── Per-fork inline tasks ─────────────────────────────────────────────────────
 
 [tasks."env:dump"]
 description = "Print all keys + values from config/<env>.env (default: production)."
@@ -65,14 +51,16 @@ echo "# $file"
 cat "$file"
 '''
 
-# ── Phase 0 — install + generate wrangler.toml from template ─────────────────
+[tasks."env:list"]
+description = "List every env config (config/<name>.env)."
+run         = "ls -1 config/*.env 2>/dev/null | grep -v template.env || echo 'no env files yet — copy config/template.env'"
 
 [tasks."1-install"]
 description = "Install npm deps (first time)."
 run         = "npm install"
 
 [tasks."wrangler:gen"]
-description = "Generate wrangler.toml from wrangler.toml.template + config/<env>.env"
+description = "Generate wrangler.toml from wrangler.toml.template + config/<env>.env."
 run = '''
 set -e
 file=$(mise run -q env:resolve)
@@ -81,224 +69,13 @@ envsubst < wrangler.toml.template > wrangler.toml
 echo "wrote wrangler.toml from $file"
 '''
 
-# ── Cloudflare resources (one-time provisioning) ─────────────────────────────
-
-[tasks."cf:provision"]
-description = "Create R2 bucket + metadata D1 for the active env. Writes resource IDs back to config/<env>.env. Idempotent."
-run = '''
-set -e
-file=$(mise run -q env:resolve)
-set -a; . "$file"; set +a
-
-# R2 bucket — idempotent. `wrangler r2 bucket info` exists in 4.84+ but
-# its presence isn't reliable across versions; `bucket list` is stable.
-if wrangler r2 bucket list 2>/dev/null | grep -qE "(^|\\s)$BACKUP_BUCKET_NAME(\\s|$)"; then
-  echo "✓ R2 bucket '$BACKUP_BUCKET_NAME' already exists"
-else
-  echo "Creating R2 bucket '$BACKUP_BUCKET_NAME' ..."
-  wrangler r2 bucket create "$BACKUP_BUCKET_NAME"
-fi
-
-# Metadata D1 — idempotent. wrangler d1 list -> grep.
-if [ -n "$METADATA_DB_ID" ]; then
-  echo "✓ Metadata D1 id already set ($METADATA_DB_ID); skipping create."
-else
-  echo "Creating D1 database '$METADATA_DB_NAME' ..."
-  out=$(wrangler d1 create "$METADATA_DB_NAME")
-  # wrangler 4.84+ emits JSON-style "database_id": "<uuid>"; older = TOML style.
-  id=$(echo "$out" | grep -oE '"database_id"\s*:\s*"[^"]+"|database_id\s*=\s*"[^"]+"' | head -1 | sed -E 's/.*"([0-9a-f-]{36})".*/\1/')
-  if [ -z "$id" ]; then
-    echo "ERROR: could not parse database_id from output:" >&2
-    echo "$out" >&2
-    exit 1
-  fi
-  # Write back to config/<env>.env (sed replace).
-  sed -i.bak -E "s|^METADATA_DB_ID=.*|METADATA_DB_ID=$id|" "$file"
-  rm -f "$file.bak"
-  echo "✓ Created D1 '$METADATA_DB_NAME' (id $id) and wrote to $file"
-fi
-
-# Apply schema.sql (idempotent — wrangler skips already-applied statements).
-echo "Applying worker/schema.sql to '$METADATA_DB_NAME' ..."
-wrangler d1 execute "$METADATA_DB_NAME" --remote --file=worker/schema.sql || true
-echo "Done. Next: fnox set ACCOUNT_ID API_KEY TEAM_DOMAIN POLICY_AUD; then mise run secrets:put-cf"
-'''
-
-# ── Secrets (fnox -> CF Worker secret store) ─────────────────────────────────
-
-[tasks."cf:access:setup"]
-description = "One-shot CF Access setup: ensure GitHub IdP + Access App for this Worker exist; write TEAM_DOMAIN + POLICY_AUD to fnox. Idempotent. Requires CLOUDFLARE_API_TOKEN with Access:Edit + Account.Settings:Read."
-depends     = ["cf:token-check"]
-run = '''
-set -e
-unset FNOX_AGE_KEY
-
-# Inputs
-file=$(mise run -q env:resolve)
-set -a; . "$file"; set +a
-TOKEN=$(fnox get CLOUDFLARE_API_TOKEN)
-ACCOUNT=$(fnox get CLOUDFLARE_ACCOUNT_ID)
-APP_DOMAIN="${WORKER_NAME}.${CF_SUBDOMAIN}.workers.dev"
-APP_NAME="${WORKER_NAME}"
-
-API="https://api.cloudflare.com/client/v4/accounts/$ACCOUNT"
-hdr=(-H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json")
-
-# Responses go to a temp dir — bash variable round-tripping corrupts the
-# raw \r in some app payloads (X.509 certs etc.) and jq fails.
-TMPD=$(mktemp -d)
-trap "rm -rf '$TMPD'" EXIT
-
-api_get()  { curl -sS "${hdr[@]}" "$API$1" -o "$TMPD/r.json"; printf '%s' "$TMPD/r.json"; }
-api_post() { curl -sS -X POST "${hdr[@]}" -d "$2" "$API$1" -o "$TMPD/r.json"; printf '%s' "$TMPD/r.json"; }
-ok()       { jq -e '.success == true' "$1" >/dev/null 2>&1; }
-err_msg()  { jq -r '.errors[]?.message // empty' "$1"; }
-
-echo "→ Checking Team Domain"
-f=$(api_get "/access/organizations")
-if ! ok "$f"; then echo "✗ access/organizations failed: $(err_msg "$f")"; exit 1; fi
-auth_domain=$(jq -r '.result.auth_domain' "$f")
-team_url="https://${auth_domain}"
-echo "  team_domain = $team_url"
-
-echo "→ Listing existing Access Apps"
-f=$(api_get "/access/apps")
-if ! ok "$f"; then echo "✗ apps list failed: $(err_msg "$f")"; exit 1; fi
-cp "$f" "$TMPD/apps.json"
-
-echo "→ Resolving Identity Provider UUID"
-# Three-tier lookup: fnox cache → existing app → fail with help.
-# /access/identity_providers needs scope we don't have, so we cache the
-# UUID in fnox once we find it. Fresh forks-of-forks pick it up directly.
-gh_idp_id=$(fnox get CF_ACCESS_GITHUB_IDP_ID 2>/dev/null || true)
-if [ -n "$gh_idp_id" ]; then
-  echo "  idp_id = $gh_idp_id  (from fnox cache)"
-else
-  gh_idp_id=$(jq -r '.result[].allowed_idps[]?' "$TMPD/apps.json" | head -1)
-  if [ -z "$gh_idp_id" ]; then
-    echo "✗ No existing Access App has an IdP set — can't infer the IdP UUID."
-    echo "  Create at least one app + IdP via dashboard once:"
-    echo "  https://one.dash.cloudflare.com/?to=/:account/access/authentication"
-    echo "  Then: fnox set --global -p keychain CF_ACCESS_GITHUB_IDP_ID <uuid>"
-    echo "  And re-run this task."
-    exit 1
-  fi
-  echo "  idp_id = $gh_idp_id  (inherited from an existing app — caching to fnox)"
-  fnox set --global -p keychain CF_ACCESS_GITHUB_IDP_ID <<< "$gh_idp_id"
-fi
-
-echo "→ Looking for existing Access App for $APP_DOMAIN"
-app_aud=$(jq -r --arg d "$APP_DOMAIN" '.result[] | select(.domain == $d) | .aud' "$TMPD/apps.json" | head -1)
-if [ -z "$app_aud" ]; then
-  echo "→ Creating Access Application for $APP_DOMAIN"
-  body=$(jq -n \
-    --arg name "$APP_NAME" \
-    --arg domain "$APP_DOMAIN" \
-    --arg idp "$gh_idp_id" \
-    '{
-      name: $name,
-      domain: $domain,
-      type: "self_hosted",
-      session_duration: "24h",
-      auto_redirect_to_identity: true,
-      allowed_idps: [$idp]
-    }')
-  f=$(api_post "/access/apps" "$body")
-  if ! ok "$f"; then echo "✗ create app failed: $(err_msg "$f")"; exit 1; fi
-  app_id=$(jq -r '.result.id' "$f")
-  app_aud=$(jq -r '.result.aud' "$f")
-  echo "  created app id=$app_id aud=$app_aud"
-
-  app_id_for_policy="$app_id"
-else
-  echo "  found existing app aud=$app_aud"
-  # Need app_id to add/check a policy below.
-  app_id_for_policy=$(jq -r --arg d "$APP_DOMAIN" '.result[] | select(.domain == $d) | .id' "$TMPD/apps.json" | head -1)
-fi
-
-# ── Allow policy: idempotent per-email-address ──────────────────────────────
-# Skipped silently if OPERATOR_EMAIL is unset. With no policy, login 403s
-# after OAuth — the first prove:access:policy run will catch that.
-if [ -n "${OPERATOR_EMAIL:-}" ]; then
-  echo "→ Ensuring allow policy for $OPERATOR_EMAIL"
-  f=$(api_get "/access/apps/$app_id_for_policy/policies")
-  existing=$(jq -r --arg e "$OPERATOR_EMAIL" \
-    '.result[]? | select(.decision=="allow") | .include[]?.email?.email | select(. == $e)' \
-    "$f" | head -1)
-  if [ -n "$existing" ]; then
-    echo "  ✓ allow-by-email policy for $OPERATOR_EMAIL already present"
-  else
-    # Build include[] with one entry per comma-separated email.
-    includes=$(echo "$OPERATOR_EMAIL" | tr ',' '\n' | jq -R '{email: {email: .}}' | jq -s '.')
-    pbody=$(jq -n --argjson include "$includes" \
-      '{name: "operator-only", decision: "allow", include: $include}')
-    f=$(api_post "/access/apps/$app_id_for_policy/policies" "$pbody")
-    if ok "$f"; then
-      echo "  ✓ created allow policy for $OPERATOR_EMAIL"
-    else
-      echo "  ⚠ policy create failed: $(err_msg "$f")"
-    fi
-  fi
-else
-  echo "→ OPERATOR_EMAIL unset in config/<env>.env — skipping policy creation"
-  echo "  (Login through OAuth will 403 until you add a policy. prove:access:policy will catch this.)"
-fi
-
-echo
-echo "→ Writing values back to fnox"
-fnox set --global -p keychain CF_ACCESS_TEAM_DOMAIN <<< "$team_url"
-fnox set --global -p keychain D1_MANAGER_POLICY_AUD <<< "$app_aud"
-echo "  ✓ CF_ACCESS_TEAM_DOMAIN  = $team_url"
-echo "  ✓ D1_MANAGER_POLICY_AUD  = $app_aud"
-echo
-echo "Next: mise run secrets:put-cf  →  mise run 10-deploy  →  mise run prove:deployed"
-'''
-
-[tasks."secrets:put-cf"]
-description = "Push CF Access secrets from fnox to the deployed Worker. Maps fnox canonical names -> d1-manager Worker env names."
-depends     = ["wrangler:gen"]
-run = '''
-set -e
-unset FNOX_AGE_KEY
-
-# Pairs of "<fnox-key>:<worker-secret-name>". Canonical fnox names live in
-# the joeblew999 ecosystem (CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID).
-# d1-manager's worker code reads ACCOUNT_ID, API_KEY, etc. — we map.
-declare -a pairs=(
-  "CLOUDFLARE_ACCOUNT_ID:ACCOUNT_ID"
-  "CLOUDFLARE_API_TOKEN:API_KEY"
-  "CF_ACCESS_TEAM_DOMAIN:TEAM_DOMAIN"
-  "D1_MANAGER_POLICY_AUD:POLICY_AUD"
-)
-
-for pair in "${pairs[@]}"; do
-  fnox_key="${pair%%:*}"
-  worker_name="${pair##*:}"
-  val=$(fnox get "$fnox_key" 2>/dev/null || true)
-  if [ -z "$val" ]; then
-    echo "ERROR: fnox has no value for '$fnox_key'." >&2
-    echo "       Set it: fnox set --global -p keychain $fnox_key" >&2
-    exit 1
-  fi
-  echo "→ wrangler secret put $worker_name  (from fnox:$fnox_key)"
-  echo "$val" | wrangler secret put "$worker_name"
-done
-'''
-
-[tasks."secrets:cf:list"]
-description = "List secrets currently set on the deployed Worker (values hidden)."
-depends     = ["wrangler:gen"]
-run         = "wrangler secret list"
-
-# ── Build + deploy ───────────────────────────────────────────────────────────
-
 [tasks."6-build"]
-description = "Build the Vite SPA (web/dist/) — required before deploy."
+description = "Build the Vite SPA (dist/) — required before deploy."
 depends     = ["1-install", "wrangler:gen"]
 run         = "npm run build"
 
 [tasks."10-deploy"]
-description = "Build + deploy the Worker. Validates CF token before deploy via shared cf:token-check."
+description = "Build + deploy the Worker. Validates CF token first."
 depends     = ["6-build", "cf:token-check"]
 run = '''
 set -e
@@ -312,7 +89,28 @@ description = "Re-deploy without rebuilding (fast iteration after wrangler.toml/
 depends     = ["wrangler:gen"]
 run         = "wrangler deploy"
 
-# ── Verification ─────────────────────────────────────────────────────────────
+[tasks."secrets:cf:list"]
+description = "List secrets currently set on the deployed Worker (values hidden)."
+depends     = ["wrangler:gen"]
+run         = "wrangler secret list"
+
+# ── Dev (local) ──────────────────────────────────────────────────────────────
+
+[tasks.dev]
+description = "Run d1-manager locally (Vite + wrangler dev)."
+depends     = ["wrangler:gen"]
+run         = "npm run dev"
+
+[tasks.tail]
+description = "Tail live worker logs."
+depends     = ["wrangler:gen"]
+run         = "wrangler tail"
+
+[tasks.whoami]
+description = "Show current Cloudflare auth identity."
+run         = "wrangler whoami"
+
+# ── prove:* — end-to-end deploy verification ─────────────────────────────────
 
 [tasks."prove:deployed"]
 description = "Smoke-test the deployed Worker — expect 302 to CF Access challenge with our AUD."
@@ -322,7 +120,7 @@ unset FNOX_AGE_KEY
 file=$(mise run -q env:resolve)
 set -a; . "$file"; set +a
 url="https://${WORKER_NAME}.${CF_SUBDOMAIN}.workers.dev"
-expected_aud=$(fnox get D1_MANAGER_POLICY_AUD)
+expected_aud=$(fnox get "$APP_POLICY_AUD_FNOX_KEY")
 
 echo "GET $url"
 hdrs=$(curl -sI "$url" | tr -d '\r')
@@ -336,12 +134,12 @@ echo "  location: ${loc:0:120}..."
 [[ "$loc" == *"/cdn-cgi/access/login/"* ]] \
   || { echo "✗ location is not a CF Access challenge URL"; exit 1; }
 [[ "$loc" == *"kid=$expected_aud"* ]] \
-  || { echo "✗ challenge AUD does not match fnox:D1_MANAGER_POLICY_AUD"; exit 1; }
+  || { echo "✗ challenge AUD does not match fnox:$APP_POLICY_AUD_FNOX_KEY"; exit 1; }
 echo "✓ CF Access is gating with the correct app AUD"
 '''
 
 [tasks."prove:access:policy"]
-description = "Verify the CF Access App for this Worker has at least one allow policy. Without one, login 403s after OAuth."
+description = "Verify the CF Access App for this Worker has at least one allow policy."
 depends     = ["cf:token-check"]
 run = '''
 set -e
@@ -358,16 +156,13 @@ API="https://api.cloudflare.com/client/v4/accounts/$ACCOUNT"
 
 curl -sS "${hdr[@]}" "$API/access/apps" -o "$TMPD/apps.json"
 APP_ID=$(jq -r --arg d "$APP_DOMAIN" '.result[] | select(.domain == $d) | .id' "$TMPD/apps.json" | head -1)
-[ -z "$APP_ID" ] && { echo "✗ no Access App found for $APP_DOMAIN — run cf:access:setup first"; exit 1; }
+[ -z "$APP_ID" ] && { echo "✗ no Access App found for $APP_DOMAIN — run cf:access-setup first"; exit 1; }
 
 curl -sS "${hdr[@]}" "$API/access/apps/$APP_ID/policies" -o "$TMPD/pol.json"
 allow_count=$(jq '[.result[] | select(.decision=="allow")] | length' "$TMPD/pol.json")
 [ "$allow_count" -lt 1 ] && {
-  echo "✗ Access App $APP_DOMAIN has no allow policy."
-  echo "  Add one (e.g. allow your email) — current login flow would 403 after OAuth."
-  echo "  Quick fix:"
-  echo "    curl -X POST -H 'Authorization: Bearer \$TOKEN' .../access/apps/$APP_ID/policies \\"
-  echo "      -d '{\"name\":\"operator-only\",\"decision\":\"allow\",\"include\":[{\"email\":{\"email\":\"YOUR@EMAIL\"}}]}'"
+  echo "✗ Access App $APP_DOMAIN has no allow policy. Login would 403 after OAuth."
+  echo "  Re-run cf:access-setup with OPERATOR_EMAIL set in config/<env>.env."
   exit 1
 }
 echo "✓ Access App $APP_DOMAIN has $allow_count allow policy/policies"
@@ -375,16 +170,16 @@ jq -r '.result[] | "  - \(.name): \(.decision) [\(.include | map(keys[0]) | join
 '''
 
 [tasks."prove:bindings"]
-description = "Confirm the deployed Worker's bindings via wrangler deploy --dry-run (no upload)."
+description = "Confirm the deployed Worker's bindings via wrangler --dry-run."
 depends     = ["wrangler:gen"]
 run = '''
 set -e
-echo "→ wrangler deploy --dry-run (validates wrangler.toml + binding resolution)"
+echo "→ wrangler deploy --dry-run"
 wrangler deploy --dry-run --outdir build/dryrun 2>&1 | grep -E '^Binding|^Total Upload|env\.|^\s+env\.' | head -20
 '''
 
 [tasks."prove:secrets"]
-description = "List secrets currently set on the deployed Worker. Should show 4: ACCOUNT_ID, API_KEY, TEAM_DOMAIN, POLICY_AUD."
+description = "List secrets on the deployed Worker. Should show 4: ACCOUNT_ID, API_KEY, TEAM_DOMAIN, POLICY_AUD."
 depends     = ["wrangler:gen"]
 run = '''
 set -e
@@ -394,7 +189,7 @@ echo
 for k in ACCOUNT_ID API_KEY TEAM_DOMAIN POLICY_AUD; do
   echo "$out" | grep -q "\"$k\"" \
     && echo "  ✓ $k present" \
-    || { echo "  ✗ $k MISSING — run secrets:put-cf"; exit 1; }
+    || { echo "  ✗ $k MISSING — run cf:secrets-put-mapped"; exit 1; }
 done
 '''
 
@@ -402,25 +197,3 @@ done
 description = "Run every prove:* check in order. Fails fast on first miss."
 depends     = ["prove:deployed", "prove:access:policy", "prove:bindings", "prove:secrets"]
 run         = "echo '✓ all checks passed.'"
-
-# ── Dev (local) ──────────────────────────────────────────────────────────────
-
-[tasks.dev]
-description = "Run d1-manager locally (Vite + wrangler dev)."
-depends     = ["wrangler:gen"]
-run         = "npm run dev"
-
-# ── Lifecycle helpers ────────────────────────────────────────────────────────
-
-[tasks.tail]
-description = "Tail live worker logs."
-depends     = ["wrangler:gen"]
-run         = "wrangler tail"
-
-[tasks.whoami]
-description = "Show current Cloudflare auth identity."
-run         = "wrangler whoami"
-
-[tasks."env:list"]
-description = "List every env config (config/<name>.env)."
-run         = "ls -1 config/*.env 2>/dev/null | grep -v template.env || echo 'no env files yet — copy config/template.env'"

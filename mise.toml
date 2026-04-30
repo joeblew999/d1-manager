@@ -90,8 +90,9 @@ set -e
 file=$(mise run -q env:resolve)
 set -a; . "$file"; set +a
 
-# R2 bucket — idempotent.
-if wrangler r2 bucket info "$BACKUP_BUCKET_NAME" >/dev/null 2>&1; then
+# R2 bucket — idempotent. `wrangler r2 bucket info` exists in 4.84+ but
+# its presence isn't reliable across versions; `bucket list` is stable.
+if wrangler r2 bucket list 2>/dev/null | grep -qE "(^|\\s)$BACKUP_BUCKET_NAME(\\s|$)"; then
   echo "✓ R2 bucket '$BACKUP_BUCKET_NAME' already exists"
 else
   echo "Creating R2 bucket '$BACKUP_BUCKET_NAME' ..."
@@ -166,16 +167,25 @@ if ! ok "$f"; then echo "✗ apps list failed: $(err_msg "$f")"; exit 1; fi
 cp "$f" "$TMPD/apps.json"
 
 echo "→ Resolving Identity Provider UUID"
-# /access/identity_providers needs scope we don't have; inherit IdP from
-# any existing app that has one (auth-service-style apps already do).
-gh_idp_id=$(jq -r '.result[].allowed_idps[]?' "$TMPD/apps.json" | head -1)
-if [ -z "$gh_idp_id" ]; then
-  echo "✗ No existing Access App has an IdP set — can't infer the IdP UUID."
-  echo "  Create at least one app + IdP via dashboard once:"
-  echo "  https://one.dash.cloudflare.com/?to=/:account/access/authentication"
-  exit 1
+# Three-tier lookup: fnox cache → existing app → fail with help.
+# /access/identity_providers needs scope we don't have, so we cache the
+# UUID in fnox once we find it. Fresh forks-of-forks pick it up directly.
+gh_idp_id=$(fnox get CF_ACCESS_GITHUB_IDP_ID 2>/dev/null || true)
+if [ -n "$gh_idp_id" ]; then
+  echo "  idp_id = $gh_idp_id  (from fnox cache)"
+else
+  gh_idp_id=$(jq -r '.result[].allowed_idps[]?' "$TMPD/apps.json" | head -1)
+  if [ -z "$gh_idp_id" ]; then
+    echo "✗ No existing Access App has an IdP set — can't infer the IdP UUID."
+    echo "  Create at least one app + IdP via dashboard once:"
+    echo "  https://one.dash.cloudflare.com/?to=/:account/access/authentication"
+    echo "  Then: fnox set --global -p keychain CF_ACCESS_GITHUB_IDP_ID <uuid>"
+    echo "  And re-run this task."
+    exit 1
+  fi
+  echo "  idp_id = $gh_idp_id  (inherited from an existing app — caching to fnox)"
+  fnox set --global -p keychain CF_ACCESS_GITHUB_IDP_ID <<< "$gh_idp_id"
 fi
-echo "  idp_id = $gh_idp_id  (inherited from an existing app)"
 
 echo "→ Looking for existing Access App for $APP_DOMAIN"
 app_aud=$(jq -r --arg d "$APP_DOMAIN" '.result[] | select(.domain == $d) | .aud' "$TMPD/apps.json" | head -1)
@@ -199,23 +209,39 @@ if [ -z "$app_aud" ]; then
   app_aud=$(jq -r '.result.aud' "$f")
   echo "  created app id=$app_id aud=$app_aud"
 
-  if [ -n "${GITHUB_ALLOW_LOGIN:-}" ]; then
-    echo "→ Adding allow policy for github user '$GITHUB_ALLOW_LOGIN'"
-    pbody=$(jq -n \
-      --arg login "$GITHUB_ALLOW_LOGIN" \
-      --arg idp "$gh_idp_id" \
-      '{
-        name: "operator-only",
-        decision: "allow",
-        include: [{
-          github: { name: $login, identity_provider_id: $idp }
-        }]
-      }')
-    f=$(api_post "/access/apps/$app_id/policies" "$pbody")
-    ok "$f" || echo "  ⚠ policy create failed: $(err_msg "$f")"
-  fi
+  app_id_for_policy="$app_id"
 else
   echo "  found existing app aud=$app_aud"
+  # Need app_id to add/check a policy below.
+  app_id_for_policy=$(jq -r --arg d "$APP_DOMAIN" '.result[] | select(.domain == $d) | .id' "$TMPD/apps.json" | head -1)
+fi
+
+# ── Allow policy: idempotent per-email-address ──────────────────────────────
+# Skipped silently if OPERATOR_EMAIL is unset. With no policy, login 403s
+# after OAuth — the first prove:access:policy run will catch that.
+if [ -n "${OPERATOR_EMAIL:-}" ]; then
+  echo "→ Ensuring allow policy for $OPERATOR_EMAIL"
+  f=$(api_get "/access/apps/$app_id_for_policy/policies")
+  existing=$(jq -r --arg e "$OPERATOR_EMAIL" \
+    '.result[]? | select(.decision=="allow") | .include[]?.email?.email | select(. == $e)' \
+    "$f" | head -1)
+  if [ -n "$existing" ]; then
+    echo "  ✓ allow-by-email policy for $OPERATOR_EMAIL already present"
+  else
+    # Build include[] with one entry per comma-separated email.
+    includes=$(echo "$OPERATOR_EMAIL" | tr ',' '\n' | jq -R '{email: {email: .}}' | jq -s '.')
+    pbody=$(jq -n --argjson include "$includes" \
+      '{name: "operator-only", decision: "allow", include: $include}')
+    f=$(api_post "/access/apps/$app_id_for_policy/policies" "$pbody")
+    if ok "$f"; then
+      echo "  ✓ created allow policy for $OPERATOR_EMAIL"
+    else
+      echo "  ⚠ policy create failed: $(err_msg "$f")"
+    fi
+  fi
+else
+  echo "→ OPERATOR_EMAIL unset in config/<env>.env — skipping policy creation"
+  echo "  (Login through OAuth will 403 until you add a policy. prove:access:policy will catch this.)"
 fi
 
 echo
@@ -299,14 +325,18 @@ url="https://${WORKER_NAME}.${CF_SUBDOMAIN}.workers.dev"
 expected_aud=$(fnox get D1_MANAGER_POLICY_AUD)
 
 echo "GET $url"
-loc=$(curl -sI "$url" | tr -d '\r' | awk '/^location:/ {print $2}')
-status=$(curl -sI "$url" | head -1 | tr -d '\r')
+hdrs=$(curl -sI "$url" | tr -d '\r')
+status=$(echo "$hdrs" | head -1)
+loc=$(echo "$hdrs" | awk '/^location:/ {print $2}')
 echo "  $status"
 echo "  location: ${loc:0:120}..."
 
-[ "${status#HTTP/2 }" != "302 " ] && [[ "$status" != HTTP/2*302* ]] && { echo "✗ expected 302, got: $status"; exit 1; }
-echo "$loc" | grep -q "/cdn-cgi/access/login/" || { echo "✗ location is not a CF Access challenge URL"; exit 1; }
-echo "$loc" | grep -q "kid=$expected_aud" || { echo "✗ challenge AUD does not match fnox:D1_MANAGER_POLICY_AUD"; exit 1; }
+[[ "$status" =~ ^HTTP/[0-9.]+[[:space:]]+302 ]] \
+  || { echo "✗ expected 302, got: $status"; exit 1; }
+[[ "$loc" == *"/cdn-cgi/access/login/"* ]] \
+  || { echo "✗ location is not a CF Access challenge URL"; exit 1; }
+[[ "$loc" == *"kid=$expected_aud"* ]] \
+  || { echo "✗ challenge AUD does not match fnox:D1_MANAGER_POLICY_AUD"; exit 1; }
 echo "✓ CF Access is gating with the correct app AUD"
 '''
 

@@ -89,7 +89,8 @@ if [ -n "$METADATA_DB_ID" ]; then
 else
   echo "Creating D1 database '$METADATA_DB_NAME' ..."
   out=$(wrangler d1 create "$METADATA_DB_NAME")
-  id=$(echo "$out" | grep -oE 'database_id\s*=\s*"[^"]+"' | head -1 | sed -E 's/.*"([^"]+)"/\1/')
+  # wrangler 4.84+ emits JSON-style "database_id": "<uuid>"; older = TOML style.
+  id=$(echo "$out" | grep -oE '"database_id"\s*:\s*"[^"]+"|database_id\s*=\s*"[^"]+"' | head -1 | sed -E 's/.*"([0-9a-f-]{36})".*/\1/')
   if [ -z "$id" ]; then
     echo "ERROR: could not parse database_id from output:" >&2
     echo "$out" >&2

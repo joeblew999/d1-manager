@@ -289,17 +289,89 @@ run         = "wrangler deploy"
 # ── Verification ─────────────────────────────────────────────────────────────
 
 [tasks."prove:deployed"]
-description = "Smoke-test the deployed Worker — expect 302 to GitHub OAuth via CF Access (proves Access is gating it)."
+description = "Smoke-test the deployed Worker — expect 302 to CF Access challenge with our AUD."
 run = '''
 set -e
+unset FNOX_AGE_KEY
 file=$(mise run -q env:resolve)
 set -a; . "$file"; set +a
 url="https://${WORKER_NAME}.${CF_SUBDOMAIN}.workers.dev"
+expected_aud=$(fnox get D1_MANAGER_POLICY_AUD)
+
 echo "GET $url"
-curl -sI "$url" | head -5
-echo
-echo "Expected: HTTP/2 302 with location: <CF Access challenge URL>"
+loc=$(curl -sI "$url" | tr -d '\r' | awk '/^location:/ {print $2}')
+status=$(curl -sI "$url" | head -1 | tr -d '\r')
+echo "  $status"
+echo "  location: ${loc:0:120}..."
+
+[ "${status#HTTP/2 }" != "302 " ] && [[ "$status" != HTTP/2*302* ]] && { echo "✗ expected 302, got: $status"; exit 1; }
+echo "$loc" | grep -q "/cdn-cgi/access/login/" || { echo "✗ location is not a CF Access challenge URL"; exit 1; }
+echo "$loc" | grep -q "kid=$expected_aud" || { echo "✗ challenge AUD does not match fnox:D1_MANAGER_POLICY_AUD"; exit 1; }
+echo "✓ CF Access is gating with the correct app AUD"
 '''
+
+[tasks."prove:access:policy"]
+description = "Verify the CF Access App for this Worker has at least one allow policy. Without one, login 403s after OAuth."
+depends     = ["cf:token-check"]
+run = '''
+set -e
+unset FNOX_AGE_KEY
+file=$(mise run -q env:resolve)
+set -a; . "$file"; set +a
+TOKEN=$(fnox get CLOUDFLARE_API_TOKEN)
+ACCOUNT=$(fnox get CLOUDFLARE_ACCOUNT_ID)
+APP_DOMAIN="${WORKER_NAME}.${CF_SUBDOMAIN}.workers.dev"
+
+TMPD=$(mktemp -d); trap "rm -rf '$TMPD'" EXIT
+hdr=(-H "Authorization: Bearer $TOKEN")
+API="https://api.cloudflare.com/client/v4/accounts/$ACCOUNT"
+
+curl -sS "${hdr[@]}" "$API/access/apps" -o "$TMPD/apps.json"
+APP_ID=$(jq -r --arg d "$APP_DOMAIN" '.result[] | select(.domain == $d) | .id' "$TMPD/apps.json" | head -1)
+[ -z "$APP_ID" ] && { echo "✗ no Access App found for $APP_DOMAIN — run cf:access:setup first"; exit 1; }
+
+curl -sS "${hdr[@]}" "$API/access/apps/$APP_ID/policies" -o "$TMPD/pol.json"
+allow_count=$(jq '[.result[] | select(.decision=="allow")] | length' "$TMPD/pol.json")
+[ "$allow_count" -lt 1 ] && {
+  echo "✗ Access App $APP_DOMAIN has no allow policy."
+  echo "  Add one (e.g. allow your email) — current login flow would 403 after OAuth."
+  echo "  Quick fix:"
+  echo "    curl -X POST -H 'Authorization: Bearer \$TOKEN' .../access/apps/$APP_ID/policies \\"
+  echo "      -d '{\"name\":\"operator-only\",\"decision\":\"allow\",\"include\":[{\"email\":{\"email\":\"YOUR@EMAIL\"}}]}'"
+  exit 1
+}
+echo "✓ Access App $APP_DOMAIN has $allow_count allow policy/policies"
+jq -r '.result[] | "  - \(.name): \(.decision) [\(.include | map(keys[0]) | join(","))]"' "$TMPD/pol.json"
+'''
+
+[tasks."prove:bindings"]
+description = "Confirm the deployed Worker's bindings via wrangler deploy --dry-run (no upload)."
+depends     = ["wrangler:gen"]
+run = '''
+set -e
+echo "→ wrangler deploy --dry-run (validates wrangler.toml + binding resolution)"
+wrangler deploy --dry-run --outdir build/dryrun 2>&1 | grep -E '^Binding|^Total Upload|env\.|^\s+env\.' | head -20
+'''
+
+[tasks."prove:secrets"]
+description = "List secrets currently set on the deployed Worker. Should show 4: ACCOUNT_ID, API_KEY, TEAM_DOMAIN, POLICY_AUD."
+depends     = ["wrangler:gen"]
+run = '''
+set -e
+out=$(wrangler secret list 2>&1)
+echo "$out"
+echo
+for k in ACCOUNT_ID API_KEY TEAM_DOMAIN POLICY_AUD; do
+  echo "$out" | grep -q "\"$k\"" \
+    && echo "  ✓ $k present" \
+    || { echo "  ✗ $k MISSING — run secrets:put-cf"; exit 1; }
+done
+'''
+
+[tasks."prove:all"]
+description = "Run every prove:* check in order. Fails fast on first miss."
+depends     = ["prove:deployed", "prove:access:policy", "prove:bindings", "prove:secrets"]
+run         = "echo '✓ all checks passed.'"
 
 # ── Dev (local) ──────────────────────────────────────────────────────────────
 
